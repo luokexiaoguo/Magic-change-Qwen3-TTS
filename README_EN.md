@@ -30,8 +30,15 @@ This project is a **portable version**, no need to install a system-global Pytho
 * **Driver**: NVIDIA driver supporting CUDA 12.1 or higher installed.
 
 ### 2. Getting the Project
-1. Extract the downloaded `Magic-change-Qwen3-TTS` archive.
-2. Ensure the folder path does not contain Chinese characters or spaces (recommended to place in the disk root directory, e.g., `E:\Magic-change-Qwen3-TTS`).
+
+You can directly download and extract the archive, or clone this project via Git:
+
+```bash
+git clone https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS.git
+cd Magic-change-Qwen3-TTS
+```
+
+1. Ensure the folder path does not contain Chinese characters or spaces (recommended to place in the disk root directory, e.g., `E:\Magic-change-Qwen3-TTS`).
 
 ### 3. Download Models
 Double-click to run **`下载模型.bat`** (Download Models.bat) in the root directory.

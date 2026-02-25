@@ -30,8 +30,15 @@ Qwen3-TTS 是由阿里巴巴 Qwen 团队开发的开源语音合成模型系列�
 *   **驱动**: 安装了支持 CUDA 12.1 或更高版本的 NVIDIA 驱动。
 
 ### 2. 获取项目
-1.  解压下载的 `Magic-change-Qwen3-TTS` 压缩包。
-2.  确保文件夹路径中不包含中文或空格（建议放在磁盘根目录，如 `E:\Magic-change-Qwen3-TTS`）。
+
+您可以直接下载压缩包解压，或通过 Git 克隆本项目：
+
+```bash
+git clone https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS.git
+cd Magic-change-Qwen3-TTS
+```
+
+1.  确保文件夹路径中不包含中文或空格（建议放在磁盘根目录，如 `E:\Magic-change-Qwen3-TTS`）。
 
 ### 3. 下载模型
 双击运行根目录下的 **`下载模型.bat`**。
