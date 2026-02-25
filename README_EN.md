@@ -25,6 +25,7 @@ This project integrates the three core capabilities of Qwen3-TTS:
 This project is a **portable version**, no need to install a system-global Python environment or configure complex CUDA environments.
 
 ### 1. Hardware Requirements
+* **OS**: Windows 10 / 11 (64-bit).
 * **GPU**: NVIDIA Graphics Card (RTX 30 series and above recommended for best performance).
 * **VRAM**: 8GB and above recommended.
 * **Driver**: NVIDIA driver supporting CUDA 12.1 or higher installed.
