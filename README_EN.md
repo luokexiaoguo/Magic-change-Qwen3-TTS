@@ -31,8 +31,17 @@ This project is a **portable version**, no need to install a system-global Pytho
 
 ### 2. Getting the Project
 
-You can directly download and extract the archive, or clone this project via Git:
+> [!IMPORTANT]
+> **Important Note**: Source code cloned directly via Git **does not include the `python312/` portable environment folder**.
+> - **Highly Recommended**: Go to the [Releases](https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS/releases) page to download the latest **full portable package** for a ready-to-use experience.
+> - **Advanced Users**: If you clone the source code, please install Python 3.12 manually and configure the environment according to `pyproject.toml`.
 
+You can choose from the following methods:
+
+#### Method A: Download Release (Recommended, Ready-to-use)
+Go to [GitHub Releases](https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS/releases) to download the full portable package.
+
+#### Method B: Clone via Git (Source only)
 ```bash
 git clone https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS.git
 cd Magic-change-Qwen3-TTS

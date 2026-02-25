@@ -31,8 +31,17 @@ Qwen3-TTS 是由阿里巴巴 Qwen 团队开发的开源语音合成模型系列�
 
 ### 2. 获取项目
 
-您可以直接下载压缩包解压，或通过 Git 克隆本项目：
+> [!IMPORTANT]
+> **重要提示**：直接通过 Git 克隆的**源代码不包含 `python312/` 便携环境文件夹**。
+> - **强烈建议**：前往 [Releases](https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS/releases) 页面下载最新发布的**完整便携包**，解压即用。
+> - **进阶用户**：若克隆源码，请自行安装 Python 3.12 并根据 `pyproject.toml` 配置环境。
 
+您可以选择以下方式：
+
+#### 方式 A：下载发行版（推荐，开箱即用）
+前往 [GitHub Releases](https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS/releases) 下载完整便携包。
+
+#### 方式 B：通过 Git 克隆（仅限源码）
 ```bash
 git clone https://github.com/luokexiaoguo/Magic-change-Qwen3-TTS.git
 cd Magic-change-Qwen3-TTS
