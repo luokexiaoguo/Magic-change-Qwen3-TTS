@@ -1,3 +1,13 @@
+# Project specific
+python312/
+models/
+sox/
+outputs/
+*.wav
+*.mp3
+*.log
+
+# Standard Python
 __pycache__/
 *.py[cod]
 *$py.class

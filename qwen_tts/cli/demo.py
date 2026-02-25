@@ -1,593 +1,676 @@
-# coding=utf-8
-# Copyright 2026 The Alibaba Qwen team.
+#!/usr/bin/env python3
+# Copyright (c) Alibaba Cloud.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-A gradio demo for Qwen3 TTS models.
-"""
 
 import argparse
+import base64
+import io
 import os
+import re
+import sys
 import tempfile
-from dataclasses import asdict
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 import gradio as gr
 import numpy as np
 import torch
+import soundfile as sf
 
-from .. import Qwen3TTSModel, VoiceClonePromptItem
+# Import Qwen3TTSModel
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
-
-def _title_case_display(s: str) -> str:
-    s = (s or "").strip()
-    s = s.replace("_", " ")
-    return " ".join([w[:1].upper() + w[1:] if w else "" for w in s.split()])
-
-
-def _build_choices_and_map(items: Optional[List[str]]) -> Tuple[List[str], Dict[str, str]]:
-    if not items:
-        return [], {}
-    display = [_title_case_display(x) for x in items]
-    mapping = {d: r for d, r in zip(display, items)}
-    return display, mapping
+# Suppress common warnings for cleaner UI
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
 
 
-def _dtype_from_str(s: str) -> torch.dtype:
-    s = (s or "").strip().lower()
-    if s in ("bf16", "bfloat16"):
-        return torch.bfloat16
-    if s in ("fp16", "float16", "half"):
-        return torch.float16
-    if s in ("fp32", "float32"):
-        return torch.float32
-    raise ValueError(f"Unsupported torch dtype: {s}. Use bfloat16/float16/float32.")
+@dataclass
+class VoiceClonePromptItem:
+    ref_code: Optional[torch.Tensor]
+    ref_spk_embedding: torch.Tensor
+    x_vector_only_mode: bool
+    icl_mode: bool
+    ref_text: Optional[str] = None
 
 
-def _maybe(v):
-    return v if v is not None else gr.update()
+# Language mapping for UI
+LANGUAGE_MAP = {
+    "自动检测": "auto",
+    "中文": "chinese",
+    "英语": "english",
+    "日语": "japanese",
+    "韩语": "korean",
+    "法语": "french",
+    "德语": "german",
+    "意大利语": "italian",
+    "葡萄牙语": "portuguese",
+    "西班牙语": "spanish",
+    "俄语": "russian"
+}
+LANGUAGE_CHOICES = list(LANGUAGE_MAP.keys())
+
+# Speaker mapping for CustomVoice
+SPEAKER_MAP = {
+    "薇薇安 (vivian)": "vivian",
+    "塞雷娜 (serena)": "serena",
+    "埃里克 (eric)": "eric",
+    "艾登 (aiden)": "aiden",
+    "迪伦 (dylan)": "dylan",
+    "瑞安 (ryan)": "ryan",
+    "苏熙 (sohee)": "sohee",
+    "小野安娜 (ono_anna)": "ono_anna",
+    "傅叔 (uncle_fu)": "uncle_fu"
+}
+SPEAKER_CHOICES = list(SPEAKER_MAP.keys())
+
+# Speaker descriptions for UI
+SPEAKER_DESCRIPTIONS = {
+    "薇薇安 (vivian)": """
+        <div class='spk-desc-animate' style='background: rgba(99, 102, 241, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #6366f1; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #6366f1;'>🎤 薇薇安 (Vivian)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：明亮且略带磁性的年轻女声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：时尚解说、元气广播、短视频配音。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：音质清脆，充满活力与现代感。</p>
+        </div>
+    """,
+    "塞雷娜 (serena)": """
+        <div class='spk-desc-animate' style='background: rgba(168, 85, 247, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #a855f7; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #a855f7;'>🎤 塞雷娜 (Serena)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：温暖、柔和且极具亲和力的年轻女声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：情感电台、治愈系故事、温柔导购。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：语调平缓，听感舒适顺滑。</p>
+        </div>
+    """,
+    "埃里克 (eric)": """
+        <div class='spk-desc-animate' style='background: rgba(234, 179, 8, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #eab308; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #eab308;'>🎤 埃里克 (Eric)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：活泼的成都男声，略带沙哑的明亮感。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：四川方言短视频、生活化对白、特色配音。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：川味韵味浓厚，风趣幽默，辨识度高。</p>
+        </div>
+    """,
+    "艾登 (aiden)": """
+        <div class='spk-desc-animate' style='background: rgba(34, 197, 94, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #22c55e; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #22c55e;'>🎤 艾登 (Aiden)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：阳光开朗的美国男声，中音清晰通透。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：美式英语学习、旅游攻略、运动品牌旁白。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：发音地道，语速自然，充满朝气。</p>
+        </div>
+    """,
+    "迪伦 (dylan)": """
+        <div class='spk-desc-animate' style='background: rgba(59, 130, 246, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #3b82f6; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #3b82f6;'>🎤 迪伦 (Dylan)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：清脆自然、字正腔圆的北京少年男声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：校园广播、科普教育、充满活力的解说。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：京腔余韵，咬字清晰，充满少年感。</p>
+        </div>
+    """,
+    "瑞安 (ryan)": """
+        <div class='spk-desc-animate' style='background: rgba(239, 68, 68, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #ef4444; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #ef4444;'>🎤 瑞安 (Ryan)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：富有动感、节奏感极强的磁性男声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：运动赛事解说、动感广告、激昂演说。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：爆发力强，充满激情与力量感。</p>
+        </div>
+    """,
+    "苏熙 (sohee)": """
+        <div class='spk-desc-animate' style='background: rgba(236, 72, 153, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #ec4899; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #ec4899;'>🎤 苏熙 (Sohee)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：温暖、细腻且富有情感深度的韩语女声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：韩语教学、影视剧配音、深情独白。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：感情充沛，能够精准表达细腻情绪。</p>
+        </div>
+    """,
+    "小野安娜 (ono_anna)": """
+        <div class='spk-desc-animate' style='background: rgba(20, 184, 166, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #14b8a6; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #14b8a6;'>🎤 小野安娜 (Ono_Anna)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：俏皮可爱、音色轻盈灵动的日语女声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：动漫配音、二次元视频、轻快生活分享。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：语气俏皮，极具辨识度，元气十足。</p>
+        </div>
+    """,
+    "傅叔 (uncle_fu)": """
+        <div class='spk-desc-animate' style='background: rgba(120, 113, 108, 0.1); padding: 12px; border-radius: 12px; border-left: 4px solid #78716c; margin-top: 10px;'>
+            <h4 style='margin: 0 0 5px 0; color: #78716c;'>🎤 傅叔 (Uncle_Fu)</h4>
+            <p style='margin: 0; font-size: 0.9rem;'><b>特点</b>：沉稳厚重、音色圆润的老年男声。</p>
+            <p style='margin: 3px 0; font-size: 0.9rem;'><b>适用场景</b>：纪录片旁白、讲座故事、成熟稳重的长辈角色。</p>
+            <p style='margin: 0; font-size: 0.9rem; opacity: 0.8;'><b>音色特征</b>：语速缓慢，充满智慧感与岁月积淀。</p>
+        </div>
+    """
+}
+
+class ModelManager:
+    """Unified model manager for dynamic loading and switching"""
+    def __init__(self, models_dir: str, device: str, dtype: torch.dtype, attn_impl: Optional[str]):
+        self.models_dir = models_dir
+        self.device = device
+        self.dtype = dtype
+        self.attn_impl = attn_impl
+        self.model = None
+        self.kind = None
+        
+        # Path configuration
+        self.paths = {
+            "custom_voice": os.path.join(models_dir, "Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+            "voice_design": os.path.join(models_dir, "Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+            "voice_clone": os.path.join(models_dir, "Qwen3-TTS-12Hz-1.7B-Base")
+        }
+
+    def load(self, kind: str) -> Qwen3TTSModel:
+        if self.kind == kind and self.model is not None:
+            return self.model
+            
+        print(f"\n[ModelManager] Switching to {kind.upper()} mode...")
+        
+        # Unload previous model to free VRAM
+        if self.model is not None:
+            del self.model
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
+        target_path = self.paths.get(kind)
+        if not target_path or not os.path.exists(target_path):
+            raise FileNotFoundError(f"Model path not found: {target_path}")
+            
+        self.model = Qwen3TTSModel.from_pretrained(
+            target_path,
+            device_map=self.device,
+            dtype=self.dtype,
+            attn_implementation=self.attn_impl
+        )
+        self.kind = kind
+        print(f"[ModelManager] Successfully loaded {kind}\n")
+        return self.model
+
+    def get_supported_languages(self):
+        if self.model:
+            return self.model.get_supported_languages()
+        return ["Auto", "ZH", "EN", "JP", "KO", "FR", "DE"]
+
+    def get_supported_speakers(self):
+        if self.model and hasattr(self.model, "get_supported_speakers"):
+            return self.model.get_supported_speakers()
+        return []
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="qwen-tts-demo",
-        description=(
-            "Launch a Gradio demo for Qwen3 TTS models (CustomVoice / VoiceDesign / Base).\n\n"
-            "Examples:\n"
-            "  qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice\n"
-            "  qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --port 8000 --ip 127.0.0.01\n"
-            "  qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-Base --device cuda:0\n"
-            "  qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --dtype bfloat16 --no-flash-attn\n"
-        ),
-        formatter_class=argparse.RawTextHelpFormatter,
-        add_help=True,
-    )
-
-    # Positional checkpoint (also supports -c/--checkpoint)
-    parser.add_argument(
-        "checkpoint_pos",
-        nargs="?",
-        default=None,
-        help="Model checkpoint path or HuggingFace repo id (positional).",
-    )
-    parser.add_argument(
-        "-c",
-        "--checkpoint",
-        default=None,
-        help="Model checkpoint path or HuggingFace repo id (optional if positional is provided).",
-    )
-
-    # Model loading / from_pretrained args
-    parser.add_argument(
-        "--device",
-        default="cuda:0",
-        help="Device for device_map, e.g. cpu, cuda, cuda:0 (default: cuda:0).",
-    )
-    parser.add_argument(
-        "--dtype",
-        default="bfloat16",
-        choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"],
-        help="Torch dtype for loading the model (default: bfloat16).",
-    )
-    parser.add_argument(
-        "--flash-attn/--no-flash-attn",
-        dest="flash_attn",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Enable FlashAttention-2 (default: enabled).",
-    )
-
-    # Gradio server args
-    parser.add_argument(
-        "--ip",
-        default="0.0.0.0",
-        help="Server bind IP for Gradio (default: 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Server port for Gradio (default: 8000).",
-    )
-    parser.add_argument(
-        "--share/--no-share",
-        dest="share",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help="Whether to create a public Gradio link (default: disabled).",
-    )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=16,
-        help="Gradio queue concurrency (default: 16).",
-    )
-
-    # HTTPS args
-    parser.add_argument(
-        "--ssl-certfile",
-        default=None,
-        help="Path to SSL certificate file for HTTPS (optional).",
-    )
-    parser.add_argument(
-        "--ssl-keyfile",
-        default=None,
-        help="Path to SSL key file for HTTPS (optional).",
-    )
-    parser.add_argument(
-        "--ssl-verify/--no-ssl-verify",
-        dest="ssl_verify",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Whether to verify SSL certificate (default: enabled).",
-    )
-
-    # Optional generation args
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="Max new tokens for generation (optional).")
-    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (optional).")
-    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling (optional).")
-    parser.add_argument("--top-p", type=float, default=None, help="Top-p sampling (optional).")
-    parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty (optional).")
-    parser.add_argument("--subtalker-top-k", type=int, default=None, help="Subtalker top-k (optional, only for tokenizer v2).")
-    parser.add_argument("--subtalker-top-p", type=float, default=None, help="Subtalker top-p (optional, only for tokenizer v2).")
-    parser.add_argument(
-        "--subtalker-temperature", type=float, default=None, help="Subtalker temperature (optional, only for tokenizer v2)."
-    )
-
-    return parser
-
-
-def _resolve_checkpoint(args: argparse.Namespace) -> str:
-    ckpt = args.checkpoint or args.checkpoint_pos
-    if not ckpt:
-        raise SystemExit(0)  # main() prints help
-    return ckpt
-
-
-def _collect_gen_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
-    mapping = {
-        "max_new_tokens": args.max_new_tokens,
-        "temperature": args.temperature,
-        "top_k": args.top_k,
-        "top_p": args.top_p,
-        "repetition_penalty": args.repetition_penalty,
-        "subtalker_top_k": args.subtalker_top_k,
-        "subtalker_top_p": args.subtalker_top_p,
-        "subtalker_temperature": args.subtalker_temperature,
-    }
-    return {k: v for k, v in mapping.items() if v is not None}
-
-
-def _normalize_audio(wav, eps=1e-12, clip=True):
-    x = np.asarray(wav)
-
-    if np.issubdtype(x.dtype, np.integer):
-        info = np.iinfo(x.dtype)
-
-        if info.min < 0:
-            y = x.astype(np.float32) / max(abs(info.min), info.max)
-        else:
-            mid = (info.max + 1) / 2.0
-            y = (x.astype(np.float32) - mid) / mid
-
-    elif np.issubdtype(x.dtype, np.floating):
-        y = x.astype(np.float32)
-        m = np.max(np.abs(y)) if y.size else 0.0
-
-        if m <= 1.0 + 1e-6:
-            pass
-        else:
-            y = y / (m + eps)
-    else:
-        raise TypeError(f"Unsupported dtype: {x.dtype}")
-
-    if clip:
-        y = np.clip(y, -1.0, 1.0)
-    
-    if y.ndim > 1:
-        y = np.mean(y, axis=-1).astype(np.float32)
-
-    return y
-
-
-def _audio_to_tuple(audio: Any) -> Optional[Tuple[np.ndarray, int]]:
+def _audio_to_tuple(audio) -> Optional[Tuple[int, np.ndarray]]:
     if audio is None:
         return None
-
-    if isinstance(audio, tuple) and len(audio) == 2 and isinstance(audio[0], int):
+    if isinstance(audio, tuple) and len(audio) == 2:
         sr, wav = audio
-        wav = _normalize_audio(wav)
-        return wav, int(sr)
-
-    if isinstance(audio, dict) and "sampling_rate" in audio and "data" in audio:
-        sr = int(audio["sampling_rate"])
-        wav = _normalize_audio(audio["data"])
-        return wav, sr
-
+        if isinstance(wav, np.ndarray):
+            return (int(sr), wav)
+    if hasattr(audio, "name"):
+        import soundfile as sf
+        wav, sr = sf.read(audio.name, dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=-1)
+        return (int(sr), wav)
     return None
 
 
-def _wav_to_gradio_audio(wav: np.ndarray, sr: int) -> Tuple[int, np.ndarray]:
-    wav = np.asarray(wav, dtype=np.float32)
-    return sr, wav
+def _wav_to_gradio_audio(wav: np.ndarray, sr: int):
+    if wav.ndim == 1:
+        wav = wav[np.newaxis, :]
+    return (sr, wav.T)
 
 
-def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
-    mt = getattr(tts.model, "tts_model_type", None)
-    if mt in ("custom_voice", "voice_design", "base"):
-        return mt
-    else:
-        raise ValueError(f"Unknown Qwen-TTS model type: {mt}")
+def save_audio_file(wav: np.ndarray, sr: int, output_dir: str = "outputs") -> str:
+    """保存音频文件到本地目录"""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"tts_{timestamp}.wav"
+    filepath = os.path.join(output_dir, filename)
+    if wav.ndim > 1:
+        wav = wav.squeeze()
+    sf.write(filepath, wav, sr)
+    return filepath
 
 
-def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]) -> gr.Blocks:
-    model_kind = _detect_model_kind(ckpt, tts)
+def _dtype_from_str(s: Optional[str]) -> Optional[torch.dtype]:
+    if not s:
+        return None
+    m = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+    }
+    return m.get(s.lower(), None)
 
-    supported_langs_raw = None
-    if callable(getattr(tts.model, "get_supported_languages", None)):
-        supported_langs_raw = tts.model.get_supported_languages()
 
-    supported_spks_raw = None
-    if callable(getattr(tts.model, "get_supported_speakers", None)):
-        supported_spks_raw = tts.model.get_supported_speakers()
+def _collect_gen_kwargs(args) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    if args.top_p is not None:
+        kwargs["top_p"] = args.top_p
+    if args.temperature is not None:
+        kwargs["temperature"] = args.temperature
+    if args.max_new_tokens is not None:
+        kwargs["max_new_tokens"] = args.max_new_tokens
+    if args.do_sample is not None:
+        kwargs["do_sample"] = args.do_sample
+    return kwargs
 
-    lang_choices_disp, lang_map = _build_choices_and_map([x for x in (supported_langs_raw or [])])
-    spk_choices_disp, spk_map = _build_choices_and_map([x for x in (supported_spks_raw or [])])
 
+def _build_choices_and_map(raw_list, is_lang=False):
+    """Build display choices and mapping from raw list with Chinese labels."""
+    if not raw_list:
+        return [], {}
+    
+    lang_names = {
+        "auto": "自动检测",
+        "chinese": "中文",
+        "english": "英语",
+        "german": "德语",
+        "italian": "意大利语",
+        "portuguese": "葡萄牙语",
+        "spanish": "西班牙语",
+        "japanese": "日语",
+        "korean": "韩语",
+        "french": "法语",
+        "russian": "俄语",
+    }
+    
+    speaker_names = {
+        "vivian": "薇薇安", "serena": "塞雷娜", "emma": "艾玛", "olivia": "奥利维亚",
+        "ava": "艾娃", "isabella": "伊莎贝拉", "sophia": "索菲亚", "mia": "米娅",
+        "charlotte": "夏洛特", "amelia": "阿米莉亚", "harper": "哈珀", "evelyn": "伊芙琳",
+        "abigail": "阿比盖尔", "ella": "艾拉", "elizabeth": "伊丽莎白", "camila": "卡米拉",
+        "luna": "露娜", "sofia": "索菲亚", "avery": "艾弗里", "mila": "米拉",
+        "aria": "阿里亚", "scarlett": "斯嘉丽", "penelope": "佩内洛普", "layla": "莱拉",
+        "chloe": "克洛伊", "victoria": "维多利亚", "madison": "麦迪逊", "eleanor": "埃莉诺",
+        "grace": "格蕾丝", "nora": "诺拉", "riley": "莱莉", "zoey": "佐伊",
+        "hannah": "汉娜", "hazel": "黑兹尔", "lily": "莉莉", "ellie": "艾莉",
+        "violet": "维奥莱特", "aurora": "奥罗拉", "savannah": "萨凡纳", "audrey": "奥黛丽",
+        "brooklyn": "布鲁克林", "bella": "贝拉", "claire": "克莱尔", "skylar": "斯凯勒",
+        "lucy": "露西", "paisley": "佩斯利", "everly": "埃弗利", "anna": "安娜",
+        "caroline": "卡罗琳", "nova": "诺瓦", "genesis": "吉妮西丝", "emilia": "艾米莉亚",
+        "kennedy": "肯尼迪", "samantha": "萨曼莎", "maya": "玛雅", "willow": "威洛",
+        "kinsley": "金斯利", "naomi": "娜奥米", "aaliyah": "阿莉娅", "elena": "埃琳娜",
+        "sarah": "萨拉", "ariana": "阿里安娜", "allison": "艾莉森", "gabriella": "加布里埃拉",
+        "alice": "爱丽丝", "madelyn": "玛德琳", "cora": "科拉", "ruby": "鲁比",
+        "eva": "伊娃", "serenity": "塞雷妮蒂", "autumn": "奥顿", "adalynn": "阿达琳",
+        "gianna": "吉安娜", "valentina": "瓦伦蒂娜", "isla": "艾拉", "eliana": "埃利安娜",
+        "quinn": "奎因", "nevaeh": "内瓦", "ivy": "艾薇", "sadie": "赛迪",
+        "piper": "派珀", "lydia": "莉迪亚", "alexa": "亚历克萨", "josephine": "约瑟芬",
+        "emery": "埃默里", "julia": "朱莉娅", "delilah": "黛利拉", "arianna": "阿里安娜",
+        "vivian": "薇薇安", "kaylee": "凯莉", "sophie": "索菲", "brielle": "布里埃尔",
+        "madeline": "玛德琳",
+    }
+    
+    display = []
+    mapping = {}
+    for x in raw_list:
+        key = str(x).lower()
+        if is_lang and key in lang_names:
+            display.append(lang_names[key])
+            mapping[lang_names[key]] = x
+        elif not is_lang and key in speaker_names:
+            display.append(speaker_names[key])
+            mapping[speaker_names[key]] = x
+        else:
+            display.append(str(x))
+            mapping[str(x)] = x
+    
+    return display, mapping
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Qwen3 TTS Gradio Demo")
+    parser.add_argument("checkpoint", type=str, nargs="?", help="Path to model checkpoint dir")
+    parser.add_argument("--checkpoint-pos", type=str, default=None, help="Path to positional checkpoint dir")
+    parser.add_argument("--ip", type=str, default="127.0.0.1", help="Server IP")
+    parser.add_argument("--port", type=int, default=8000, help="Server port")
+    parser.add_argument("--share", action="store_true", help="Enable Gradio share")
+    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
+    parser.add_argument("--dtype", type=str, default=None, help="dtype: fp32/fp16/bf16")
+    parser.add_argument("--flash-attn", action="store_true", help="Use flash attention 2")
+    parser.add_argument("--concurrency", type=int, default=1, help="Concurrency limit")
+    parser.add_argument("--ssl-certfile", type=str, default=None, help="SSL certificate file")
+    parser.add_argument("--ssl-keyfile", type=str, default=None, help="SSL key file")
+    parser.add_argument("--ssl-verify", action="store_true", help="Verify SSL")
+    parser.add_argument("--top-p", type=float, default=None, help="Top-p sampling")
+    parser.add_argument("--temperature", type=float, default=None, help="Temperature")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="Max new tokens")
+    parser.add_argument("--do-sample", type=lambda x: x.lower() in ("true", "1"), default=None, help="Do sample")
+    return parser
+
+
+def _resolve_checkpoint(args) -> str:
+    if args.checkpoint:
+        return args.checkpoint
+    if args.checkpoint_pos:
+        return args.checkpoint_pos
+    raise ValueError("Either checkpoint or checkpoint-pos must be provided")
+
+
+def build_demo(manager: ModelManager, gen_kwargs_default: Dict[str, Any]):
     def _gen_common_kwargs() -> Dict[str, Any]:
         return dict(gen_kwargs_default)
 
-    theme = gr.themes.Soft(
-        font=[gr.themes.GoogleFont("Source Sans Pro"), "Arial", "sans-serif"],
-    )
+    # Modern Theme & CSS - Unified Studio Design
+    css = """
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
-    css = ".gradio-container {max-width: none !important;}"
+    :root {
+        --primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #3b82f6 100%);
+        --bg-blur: blur(16px);
+        --transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        --card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.15);
+        --bg-app: #f5f7ff;
+        --glass-bg: rgba(255, 255, 255, 0.7);
+        --glass-border: rgba(255, 255, 255, 0.4);
+        --text-main: #1e293b;
+        --text-muted: #64748b;
+        --radius: 20px;
+    }
 
-    with gr.Blocks(theme=theme, css=css) as demo:
-        gr.Markdown(
-            f"""
-# Qwen3 TTS Demo
-**Checkpoint:** `{ckpt}`  
-**Model Type:** `{model_kind}`  
-"""
-        )
+    .dark {
+        --bg-app: #0f172a;
+        --glass-bg: rgba(30, 41, 59, 0.7);
+        --glass-border: rgba(255, 255, 255, 0.1);
+        --text-main: #f8fafc;
+        --text-muted: #94a3b8;
+    }
 
-        if model_kind == "custom_voice":
+    * { font-family: 'Inter', system-ui, sans-serif !important; }
+
+    body, .gradio-container {
+        background: var(--bg-app) !important;
+        color: var(--text-main) !important;
+        min-height: 100vh !important;
+        display: flex !important;
+        flex-direction: column !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    .main-container {
+        flex: 1 0 auto !important;
+        max-width: 1200px !important;
+        margin: 0 auto !important;
+        padding: 10px 20px !important;
+        width: 100% !important;
+    }
+
+    .glass-card {
+        background: var(--glass-bg) !important;
+        backdrop-filter: var(--bg-blur) !important;
+        -webkit-backdrop-filter: var(--bg-blur) !important;
+        border: 1px solid var(--glass-border) !important;
+        border-radius: var(--radius) !important;
+        box-shadow: var(--card-shadow) !important;
+        padding: 16px !important;
+        margin-bottom: 12px !important;
+        transition: var(--transition);
+        box-sizing: border-box !important;
+    }
+
+    /* Systemic Height Synchronization Rules */
+    .sync-height-group {
+        display: flex !important;
+        flex-direction: column !important;
+        min-height: 320px !important;
+        transition: height 0.3s ease-out !important;
+    }
+
+    /* Centered Titles in Headers */
+    .sync-height-group h3, .sync-height-group .header-title {
+        text-align: center !important;
+        width: 100% !important;
+        margin: 0 0 15px 0 !important;
+        font-weight: 700 !important;
+        line-height: 1.4 !important;
+    }
+
+    /* Responsive Heights */
+    @media (max-width: 767px) {
+        .sync-height-group { min-height: 240px !important; }
+    }
+    @media (min-width: 768px) and (max-width: 1024px) {
+        .sync-height-group { min-height: 280px !important; }
+    }
+    @media (min-width: 1025px) {
+        .sync-height-group { min-height: 320px !important; }
+    }
+
+    /* Force Title Visibility */
+    #studio-title-main {
+        font-size: 2.5rem !important;
+        font-weight: 800 !important;
+        color: #6366f1 !important; /* Solid Indigo */
+        text-align: center !important;
+        margin: 10px 0 !important;
+        display: block !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        background: none !important;
+        -webkit-text-fill-color: #6366f1 !important;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+    }
+
+    .primary-btn {
+        background: var(--primary-gradient) !important;
+        border: none !important;
+        color: white !important;
+        font-weight: 700 !important;
+        padding: 12px !important;
+        border-radius: 12px !important;
+        cursor: pointer !important;
+        width: 100% !important;
+        transition: var(--transition);
+    }
+    
+    .primary-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
+    }
+
+    #qwen-final-footer {
+        flex-shrink: 0 !important;
+        margin-top: auto !important;
+        padding: 20px !important;
+        text-align: center !important;
+        border-top: 1px solid var(--glass-border);
+        background: var(--glass-bg);
+        width: 100%;
+    }
+    """
+
+    with gr.Blocks(css=css, theme=gr.themes.Default()) as demo:
+        # Height Synchronization Logic
+        gr.HTML("""
+            <script>
+            (function() {
+                function syncHeights() {
+                    const groups = document.querySelectorAll('.sync-height-group');
+                    if (groups.length < 2) return;
+                    
+                    let maxHeight = 0;
+                    // Reset to measure natural height
+                    groups.forEach(g => {
+                        g.style.height = 'auto';
+                        // Only measure visible elements
+                        if (g.offsetWidth > 0 || g.offsetHeight > 0) {
+                            maxHeight = Math.max(maxHeight, g.offsetHeight);
+                        }
+                    });
+                    
+                    // Apply max height to all visible sync groups
+                    groups.forEach(g => {
+                        if (g.offsetWidth > 0 || g.offsetHeight > 0) {
+                            g.style.height = maxHeight + 'px';
+                        }
+                    });
+                }
+
+                // Debounce to prevent performance issues
+                function debounce(func, wait) {
+                    let timeout;
+                    return function() {
+                        clearTimeout(timeout);
+                        timeout = setTimeout(func, wait);
+                    };
+                }
+
+                const debouncedSync = debounce(syncHeights, 300);
+
+                // Observe for content changes (Gradio dynamic updates)
+                const observer = new MutationObserver((mutations) => {
+                    debouncedSync();
+                });
+
+                document.addEventListener('DOMContentLoaded', () => {
+                    const config = { childList: true, subtree: true, characterData: true };
+                    const container = document.querySelector('.main-container');
+                    if (container) observer.observe(container, config);
+                    
+                    window.addEventListener('resize', debouncedSync);
+                    
+                    // Initial sync after Gradio finishes rendering
+                    setTimeout(syncHeights, 1500);
+                    
+                    // Sync when tab changes
+                    document.addEventListener('click', (e) => {
+                        if (e.target.closest('button')) {
+                            setTimeout(syncHeights, 100);
+                        }
+                    });
+                });
+            })();
+            </script>
+        """)
+
+        with gr.Column(elem_classes=["main-container"]):
+            # Hero Section
+            with gr.Column():
+                gr.HTML('<span style="font-size: 48px; display: block; text-align: center; margin-bottom: 0;">🎙️</span>')
+                gr.HTML('<h1 id="studio-title-main">Magic-change-Qwen3-TTS Studio</h1>')
+                gr.HTML('<p style="text-align: center; font-size: 1.1rem; opacity: 0.8; margin-bottom: 20px;">全能语音创作中心 · 统一模型管理架构</p>')
+
             with gr.Row():
-                with gr.Column(scale=2):
-                    text_in = gr.Textbox(
-                        label="Text (待合成文本)",
-                        lines=4,
-                        placeholder="Enter text to synthesize (输入要合成的文本).",
-                    )
-                    with gr.Row():
-                        lang_in = gr.Dropdown(
-                            label="Language (语种)",
-                            choices=lang_choices_disp,
-                            value="Auto",
-                            interactive=True,
-                        )
-                        spk_in = gr.Dropdown(
-                            label="Speaker (说话人)",
-                            choices=spk_choices_disp,
-                            value="Vivian",
-                            interactive=True,
-                        )
-                    instruct_in = gr.Textbox(
-                        label="Instruction (Optional) (控制指令，可不输入)",
-                        lines=2,
-                        placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
-                    )
-                    btn = gr.Button("Generate (生成)", variant="primary")
+                # Left Column: Model Selection & Inputs
                 with gr.Column(scale=3):
-                    audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                    err = gr.Textbox(label="Status (状态)", lines=2)
+                    with gr.Tabs() as tabs:
+                        # Tab 1: Custom Voice
+                        with gr.Tab("🎭 预设音色 (CustomVoice)", id="custom_voice"):
+                            with gr.Group(elem_classes=["glass-card", "sync-height-group"], elem_id="left-sync-custom"):
+                                gr.HTML("<h3 class='header-title'>📝 文本输入 (Text Input)</h3>")
+                                text_custom = gr.Textbox(label="", placeholder="输入文字...", lines=5, show_label=False)
+                                with gr.Row():
+                                    lang_custom = gr.Dropdown(label="语言", choices=LANGUAGE_CHOICES, value="自动检测")
+                                    spk_custom = gr.Dropdown(label="音色选择", choices=SPEAKER_CHOICES, value="薇薇安 (vivian)")
+                                
+                                # Speaker detail description area
+                                spk_desc_custom = gr.HTML(SPEAKER_DESCRIPTIONS["薇薇安 (vivian)"])
+                                
+                                instruct_custom = gr.Textbox(label="情感指令", placeholder="例如：温柔地、开心地...")
+                                btn_custom = gr.Button("立即生成 ✨", elem_classes=["primary-btn"])
 
-            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
-                try:
-                    if not text or not text.strip():
-                        return None, "Text is required (必须填写文本)."
-                    if not spk_disp:
-                        return None, "Speaker is required (必须选择说话人)."
-                    language = lang_map.get(lang_disp, "Auto")
-                    speaker = spk_map.get(spk_disp, spk_disp)
-                    kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_custom_voice(
-                        text=text.strip(),
-                        language=language,
-                        speaker=speaker,
-                        instruct=(instruct or "").strip() or None,
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                except Exception as e:
-                    return None, f"{type(e).__name__}: {e}"
+                        # Tab 2: Voice Design
+                        with gr.Tab("🎨 语音设计 (VoiceDesign)", id="voice_design"):
+                            with gr.Group(elem_classes=["glass-card", "sync-height-group"], elem_id="left-sync-design"):
+                                gr.HTML("<h3 class='header-title'>🎨 文本输入 (Text Input)</h3>")
+                                text_design = gr.Textbox(label="", placeholder="输入文字...", lines=5, show_label=False)
+                                lang_design = gr.Dropdown(label="语言", choices=LANGUAGE_CHOICES, value="自动检测")
+                                instruct_design = gr.Textbox(label="音色描述", placeholder="如：深沉的中年男声，语气沉稳...")
+                                btn_design = gr.Button("开始设计 ⚡", elem_classes=["primary-btn"])
 
-            btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
+                        # Tab 3: Voice Clone
+                        with gr.Tab("👥 语音克隆 (VoiceClone)", id="voice_clone"):
+                            with gr.Group(elem_classes=["glass-card", "sync-height-group"], elem_id="left-sync-clone"):
+                                gr.HTML("<h3 class='header-title'>👥 文本输入 (Text Input)</h3>")
+                                text_clone = gr.Textbox(label="", placeholder="输入需要合成的文字...", lines=5, show_label=False)
+                                lang_clone = gr.Dropdown(label="语言", choices=LANGUAGE_CHOICES, value="自动检测")
+                                ref_audio = gr.Audio(label="参考音频", type="filepath")
+                                ref_text = gr.Textbox(label="参考文本", placeholder="请输入参考音频中说话人的原话（ICL 模式必填）...")
+                                x_vector_only = gr.Checkbox(label="仅使用说话人向量模式 (免参考文本)", value=False)
+                                btn_clone = gr.Button("启动克隆 🚀", elem_classes=["primary-btn"])
 
-        elif model_kind == "voice_design":
-            with gr.Row():
+                # Right Column: Shared Output & Logs
                 with gr.Column(scale=2):
-                    text_in = gr.Textbox(
-                        label="Text (待合成文本)",
-                        lines=4,
-                        value="It's in the top drawer... wait, it's empty? No way, that's impossible! I'm sure I put it there!"
-                    )
-                    with gr.Row():
-                        lang_in = gr.Dropdown(
-                            label="Language (语种)",
-                            choices=lang_choices_disp,
-                            value="Auto",
-                            interactive=True,
-                        )
-                    design_in = gr.Textbox(
-                        label="Voice Design Instruction (音色描述)",
-                        lines=3,
-                        value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
-                    )
-                    btn = gr.Button("Generate (生成)", variant="primary")
-                with gr.Column(scale=3):
-                    audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                    err = gr.Textbox(label="Status (状态)", lines=2)
+                    with gr.Group(elem_classes=["glass-card", "sync-height-group"], elem_id="right-sync-output"):
+                        gr.HTML("<h3 class='header-title'>🔊 渲染输出 (Render Output)</h3>")
+                        audio_out = gr.Audio(label="", show_label=False)
+                        gr.HTML("<div style='margin-top: 20px;'><h3 class='header-title'>ℹ️ 系统日志 (Logs)</h3></div>")
+                        status_out = gr.Textbox(label="", show_label=False, placeholder="准备就绪...", interactive=False, lines=10)
 
-            def run_voice_design(text: str, lang_disp: str, design: str):
-                try:
-                    if not text or not text.strip():
-                        return None, "Text is required (必须填写文本)."
-                    if not design or not design.strip():
-                        return None, "Voice design instruction is required (必须填写音色描述)."
-                    language = lang_map.get(lang_disp, "Auto")
-                    kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_voice_design(
-                        text=text.strip(),
-                        language=language,
-                        instruct=design.strip(),
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                except Exception as e:
-                    return None, f"{type(e).__name__}: {e}"
+        # Shared Footer
+        gr.HTML("""
+            <style>
+            @keyframes fadeInScale {
+                from { opacity: 0; transform: translateY(10px) scale(0.98); }
+                to { opacity: 1; transform: translateY(0) scale(1); }
+            }
+            .spk-desc-animate {
+                animation: fadeInScale 0.4s ease-out forwards;
+            }
+            </style>
+            <div id="qwen-final-footer">
+                <p>© 2026 我的随手日记 | 基于阿里云 Qwen3 模型开发</p>
+                <p style="font-size: 0.7rem;">⚠️ 本工具生成的语音内容由 AI 自动合成，请勿用于非法用途。</p>
+            </div>
+        """)
 
-            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
+        # Backend Logic with Dynamic Loading
+        def run_task(kind, text, lang_label, spk_label=None, instruct=None, audio=None, r_text=None, x_vec=False, progress=gr.Progress()):
+            try:
+                if not text or not text.strip():
+                    return None, "请输入合成文本"
+                
+                # Map labels to internal values
+                lang = LANGUAGE_MAP.get(lang_label, "auto")
+                spk = SPEAKER_MAP.get(spk_label, spk_label) # Use label directly if not in map (for VoiceDesign/VoiceClone)
+                
+                # Dynamic Model Switching
+                progress(0.1, desc=f"正在检查模型状态...")
+                if manager.kind != kind:
+                    progress(0.2, desc=f"正在动态加载 {kind.upper()} 模型，请稍候...")
+                    manager.load(kind)
+                
+                tts = manager.model
+                progress(0.4, desc="模型就绪，正在分析文本...")
+                
+                # Run actual inference based on kind
+                if kind == "custom_voice":
+                    wavs, sr = tts.generate_custom_voice(text=text.strip(), language=lang, speaker=spk, instruct=instruct, **_gen_common_kwargs())
+                elif kind == "voice_design":
+                    wavs, sr = tts.generate_voice_design(text=text.strip(), language=lang, instruct=instruct, **_gen_common_kwargs())
+                else:  # voice_clone
+                    if not audio:
+                        return None, "❌ 错误：语音克隆模式需要上传参考音频"
+                    
+                    # Validate ref_text requirement for ICL mode
+                    if not bool(x_vec) and (not r_text or not r_text.strip()):
+                        return None, "❌ 错误：在当前（ICL）模式下，必须提供参考音频对应的【参考文本】以获得更好的克隆效果。如果是为了免输入文本，请勾选“仅使用说话人向量模式”。"
+                        
+                    wavs, sr = tts.generate_voice_clone(text=text.strip(), language=lang, ref_audio=audio, ref_text=r_text, x_vector_only_mode=bool(x_vec), **_gen_common_kwargs())
+                
+                progress(0.8, desc="音频生成完成，正在保存...")
+                output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "outputs")
+                saved_path = save_audio_file(wavs[0], sr, output_dir)
+                
+                return _wav_to_gradio_audio(wavs[0], sr), f"✅ 渲染成功！\n模式: {kind.upper()}\n路径: {saved_path}"
+            except Exception as e:
+                import traceback
+                return None, f"❌ 任务失败: {str(e)}\n{traceback.format_exc()}"
 
-        else:  # voice_clone for base
-            with gr.Tabs():
-                with gr.Tab("Clone & Generate (克隆并合成)"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            ref_audio = gr.Audio(
-                                label="Reference Audio (参考音频)",
-                            )
-                            ref_text = gr.Textbox(
-                                label="Reference Text (参考音频文本)",
-                                lines=2,
-                                placeholder="Required if not set use x-vector only (不勾选use x-vector only时必填).",
-                            )
-                            xvec_only = gr.Checkbox(
-                                label="Use x-vector only (仅用说话人向量，效果有限，但不用传入参考音频文本)",
-                                value=False,
-                            )
+        # Event Bindings
+        def update_spk_desc(spk_name):
+            return SPEAKER_DESCRIPTIONS.get(spk_name, "")
+            
+        spk_custom.change(fn=update_spk_desc, inputs=[spk_custom], outputs=[spk_desc_custom])
 
-                        with gr.Column(scale=2):
-                            text_in = gr.Textbox(
-                                label="Target Text (待合成文本)",
-                                lines=4,
-                                placeholder="Enter text to synthesize (输入要合成的文本).",
-                            )
-                            lang_in = gr.Dropdown(
-                                label="Language (语种)",
-                                choices=lang_choices_disp,
-                                value="Auto",
-                                interactive=True,
-                            )
-                            btn = gr.Button("Generate (生成)", variant="primary")
-
-                        with gr.Column(scale=3):
-                            audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                            err = gr.Textbox(label="Status (状态)", lines=2)
-
-                    def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str):
-                        try:
-                            if not text or not text.strip():
-                                return None, "Target text is required (必须填写待合成文本)."
-                            at = _audio_to_tuple(ref_aud)
-                            if at is None:
-                                return None, "Reference audio is required (必须上传参考音频)."
-                            if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
-                                return None, (
-                                    "Reference text is required when use x-vector only is NOT enabled.\n"
-                                    "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
-                                )
-                            language = lang_map.get(lang_disp, "Auto")
-                            kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                ref_audio=at,
-                                ref_text=(ref_txt.strip() if ref_txt else None),
-                                x_vector_only_mode=bool(use_xvec),
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                        except Exception as e:
-                            return None, f"{type(e).__name__}: {e}"
-
-                    btn.click(
-                        run_voice_clone,
-                        inputs=[ref_audio, ref_text, xvec_only, text_in, lang_in],
-                        outputs=[audio_out, err],
-                    )
-
-                with gr.Tab("Save / Load Voice (保存/加载克隆音色)"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            gr.Markdown(
-                                """
-### Save Voice (保存音色)
-Upload reference audio and text, choose use x-vector only or not, then save a reusable voice prompt file.  
-(上传参考音频和参考文本，选择是否使用 use x-vector only 模式后保存为可复用的音色文件)
-"""
-                            )
-                            ref_audio_s = gr.Audio(label="Reference Audio (参考音频)", type="numpy")
-                            ref_text_s = gr.Textbox(
-                                label="Reference Text (参考音频文本)",
-                                lines=2,
-                                placeholder="Required if not set use x-vector only (不勾选use x-vector only时必填).",
-                            )
-                            xvec_only_s = gr.Checkbox(
-                                label="Use x-vector only (仅用说话人向量，效果有限，但不用传入参考音频文本)",
-                                value=False,
-                            )
-                            save_btn = gr.Button("Save Voice File (保存音色文件)", variant="primary")
-                            prompt_file_out = gr.File(label="Voice File (音色文件)")
-
-                        with gr.Column(scale=2):
-                            gr.Markdown(
-                                """
-### Load Voice & Generate (加载音色并合成)
-Upload a previously saved voice file, then synthesize new text.  
-(上传已保存提示文件后，输入新文本进行合成)
-"""
-                            )
-                            prompt_file_in = gr.File(label="Upload Prompt File (上传提示文件)")
-                            text_in2 = gr.Textbox(
-                                label="Target Text (待合成文本)",
-                                lines=4,
-                                placeholder="Enter text to synthesize (输入要合成的文本).",
-                            )
-                            lang_in2 = gr.Dropdown(
-                                label="Language (语种)",
-                                choices=lang_choices_disp,
-                                value="Auto",
-                                interactive=True,
-                            )
-                            gen_btn2 = gr.Button("Generate (生成)", variant="primary")
-
-                        with gr.Column(scale=3):
-                            audio_out2 = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                            err2 = gr.Textbox(label="Status (状态)", lines=2)
-
-                    def save_prompt(ref_aud, ref_txt: str, use_xvec: bool):
-                        try:
-                            at = _audio_to_tuple(ref_aud)
-                            if at is None:
-                                return None, "Reference audio is required (必须上传参考音频)."
-                            if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
-                                return None, (
-                                    "Reference text is required when use x-vector only is NOT enabled.\n"
-                                    "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
-                                )
-                            items = tts.create_voice_clone_prompt(
-                                ref_audio=at,
-                                ref_text=(ref_txt.strip() if ref_txt else None),
-                                x_vector_only_mode=bool(use_xvec),
-                            )
-                            payload = {
-                                "items": [asdict(it) for it in items],
-                            }
-                            fd, out_path = tempfile.mkstemp(prefix="voice_clone_prompt_", suffix=".pt")
-                            os.close(fd)
-                            torch.save(payload, out_path)
-                            return out_path, "Finished. (生成完成)"
-                        except Exception as e:
-                            return None, f"{type(e).__name__}: {e}"
-
-                    def load_prompt_and_gen(file_obj, text: str, lang_disp: str):
-                        try:
-                            if file_obj is None:
-                                return None, "Voice file is required (必须上传音色文件)."
-                            if not text or not text.strip():
-                                return None, "Target text is required (必须填写待合成文本)."
-
-                            path = getattr(file_obj, "name", None) or getattr(file_obj, "path", None) or str(file_obj)
-                            payload = torch.load(path, map_location="cpu", weights_only=True)
-                            if not isinstance(payload, dict) or "items" not in payload:
-                                return None, "Invalid file format (文件格式不正确)."
-
-                            items_raw = payload["items"]
-                            if not isinstance(items_raw, list) or len(items_raw) == 0:
-                                return None, "Empty voice items (音色为空)."
-
-                            items: List[VoiceClonePromptItem] = []
-                            for d in items_raw:
-                                if not isinstance(d, dict):
-                                    return None, "Invalid item format in file (文件内部格式错误)."
-                                ref_code = d.get("ref_code", None)
-                                if ref_code is not None and not torch.is_tensor(ref_code):
-                                    ref_code = torch.tensor(ref_code)
-                                ref_spk = d.get("ref_spk_embedding", None)
-                                if ref_spk is None:
-                                    return None, "Missing ref_spk_embedding (缺少说话人向量)."
-                                if not torch.is_tensor(ref_spk):
-                                    ref_spk = torch.tensor(ref_spk)
-
-                                items.append(
-                                    VoiceClonePromptItem(
-                                        ref_code=ref_code,
-                                        ref_spk_embedding=ref_spk,
-                                        x_vector_only_mode=bool(d.get("x_vector_only_mode", False)),
-                                        icl_mode=bool(d.get("icl_mode", not bool(d.get("x_vector_only_mode", False)))),
-                                        ref_text=d.get("ref_text", None),
-                                    )
-                                )
-
-                            language = lang_map.get(lang_disp, "Auto")
-                            kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                voice_clone_prompt=items,
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                        except Exception as e:
-                            return None, (
-                                f"Failed to read or use voice file. Check file format/content.\n"
-                                f"(读取或使用音色文件失败，请检查文件格式或内容)\n"
-                                f"{type(e).__name__}: {e}"
-                            )
-
-                    save_btn.click(save_prompt, inputs=[ref_audio_s, ref_text_s, xvec_only_s], outputs=[prompt_file_out, err2])
-                    gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2], outputs=[audio_out2, err2])
-
-        gr.Markdown(
-            """
-**Disclaimer (免责声明)**  
-- The audio is automatically generated/synthesized by an AI model solely to demonstrate the model’s capabilities; it may be inaccurate or inappropriate, does not represent the views of the developer/operator, and does not constitute professional advice. You are solely responsible for evaluating, using, distributing, or relying on this audio; to the maximum extent permitted by applicable law, the developer/operator disclaims liability for any direct, indirect, incidental, or consequential damages arising from the use of or inability to use the audio, except where liability cannot be excluded by law. Do not use this service to intentionally generate or replicate unlawful, harmful, defamatory, fraudulent, deepfake, or privacy/publicity/copyright/trademark‑infringing content; if a user prompts, supplies materials, or otherwise facilitates any illegal or infringing conduct, the user bears all legal consequences and the developer/operator is not responsible.
-- 音频由人工智能模型自动生成/合成，仅用于体验与展示模型效果，可能存在不准确或不当之处；其内容不代表开发者/运营方立场，亦不构成任何专业建议。用户应自行评估并承担使用、传播或依赖该音频所产生的一切风险与责任；在适用法律允许的最大范围内，开发者/运营方不对因使用或无法使用本音频造成的任何直接、间接、附带或后果性损失承担责任（法律另有强制规定的除外）。严禁利用本服务故意引导生成或复制违法、有害、诽谤、欺诈、深度伪造、侵犯隐私/肖像/著作权/商标等内容；如用户通过提示词、素材或其他方式实施或促成任何违法或侵权行为，相关法律后果由用户自行承担，与开发者/运营方无关。
-"""
-        )
+        btn_custom.click(fn=run_task, inputs=[gr.State("custom_voice"), text_custom, lang_custom, spk_custom, instruct_custom], outputs=[audio_out, status_out])
+        btn_design.click(fn=run_task, inputs=[gr.State("voice_design"), text_design, lang_design, gr.State(None), instruct_design], outputs=[audio_out, status_out])
+        btn_clone.click(fn=run_task, inputs=[gr.State("voice_clone"), text_clone, lang_clone, gr.State(None), gr.State(None), ref_audio, ref_text, x_vector_only], outputs=[audio_out, status_out])
 
     return demo
 
@@ -596,24 +679,22 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not args.checkpoint and not args.checkpoint_pos:
-        parser.print_help()
-        return 0
-
-    ckpt = _resolve_checkpoint(args)
-
+    models_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    models_dir = os.path.join(models_dir, "models")
+    
     dtype = _dtype_from_str(args.dtype)
     attn_impl = "flash_attention_2" if args.flash_attn else None
 
-    tts = Qwen3TTSModel.from_pretrained(
-        ckpt,
-        device_map=args.device,
-        dtype=dtype,
-        attn_implementation=attn_impl,
+    # Initialize Unified Model Manager
+    manager = ModelManager(
+        models_dir=models_dir,
+        device=args.device,
+        dtype=dtype or torch.float16,
+        attn_impl=attn_impl
     )
 
     gen_kwargs_default = _collect_gen_kwargs(args)
-    demo = build_demo(tts, ckpt, gen_kwargs_default)
+    demo = build_demo(manager, gen_kwargs_default)
 
     launch_kwargs: Dict[str, Any] = dict(
         server_name=args.ip,

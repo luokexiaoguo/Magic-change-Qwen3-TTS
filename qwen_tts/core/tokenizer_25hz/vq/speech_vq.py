@@ -13,6 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import sys
+
+# Add local SoX path to system PATH
+current_dir = os.path.abspath(__file__)
+parent_dir = os.path.dirname(current_dir)
+for _ in range(4):
+    parent_dir = os.path.dirname(parent_dir)
+sox_path = os.path.join(parent_dir, 'sox', 'sox-14.4.2')
+if sox_path not in os.environ['PATH']:
+    os.environ['PATH'] = sox_path + os.pathsep + os.environ['PATH']
+
 import sox
 import copy
 import torch
